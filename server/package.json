@@ -5,7 +5,8 @@
   "description": "Backend inicial para ZONA CERO: cuentas, progreso y salas Socket.IO de hasta 30 jugadores.",
   "main": "server.js",
   "scripts": {"start": "node server.js", "dev": "node --watch server.js"},
-  "engines": {"node": ">=20"},
+  "engines": {
+  "node": ">=22 <23"
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^11.8.1",
