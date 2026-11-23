@@ -2912,5 +2912,195 @@
       animate();
     };
   </script>
+
+
+  <!-- ZONA CERO ONLINE: autenticación y salas reales -->
+  <div id="zc-online-modal" class="fixed inset-0 z-[80] hidden bg-slate-950/90 backdrop-blur-md flex items-center justify-center p-4" style="touch-action:auto">
+    <div class="w-full max-w-md rounded-2xl border border-cyan-500/40 bg-slate-900 p-5 shadow-2xl space-y-3" style="touch-action:auto">
+      <div class="flex items-center justify-between">
+        <div>
+          <div class="text-cyan-300 text-xs font-bold tracking-widest">ZONA CERO • ONLINE</div>
+          <h2 class="font-game text-2xl font-bold text-white">MULTIJUGADOR</h2>
+        </div>
+        <button id="zc-online-close" class="rounded-lg bg-slate-800 px-3 py-2 text-white">✕</button>
+      </div>
+      <p class="text-xs text-slate-300">Crea una cuenta o inicia sesión para conectarte al servidor y compartir una sala.</p>
+      <label class="block text-xs text-slate-300">Usuario (3–18 letras, números o _)</label>
+      <input id="zc-username" autocomplete="username" maxlength="18" class="w-full rounded-lg border border-slate-600 bg-slate-950 px-3 py-2 text-white" placeholder="TuUsuario" style="touch-action:auto;user-select:text" />
+      <label class="block text-xs text-slate-300">Contraseña (mínimo 10 caracteres)</label>
+      <input id="zc-password" type="password" autocomplete="current-password" maxlength="72" class="w-full rounded-lg border border-slate-600 bg-slate-950 px-3 py-2 text-white" placeholder="No reutilices tu contraseña personal" style="touch-action:auto;user-select:text" />
+      <div class="grid grid-cols-2 gap-2">
+        <button id="zc-register" class="rounded-lg bg-cyan-500 px-3 py-2 font-bold text-slate-950">Crear cuenta</button>
+        <button id="zc-login" class="rounded-lg bg-slate-700 px-3 py-2 font-bold text-white">Iniciar sesión</button>
+      </div>
+      <div id="zc-account-status" class="rounded-lg bg-slate-950 p-2 text-xs text-slate-300">Desconectado. Inicia sesión o crea una cuenta.</div>
+      <div class="border-t border-slate-700 pt-3 space-y-2">
+        <div class="text-sm font-bold text-amber-300">SALAS (hasta 30 conexiones)</div>
+        <button id="zc-create-room" disabled class="w-full rounded-lg bg-amber-500 px-3 py-2 font-bold text-slate-950 disabled:opacity-40">Crear sala online</button>
+        <div class="flex gap-2">
+          <input id="zc-room-code" maxlength="6" placeholder="Código de sala" class="min-w-0 flex-1 rounded-lg border border-slate-600 bg-slate-950 px-3 py-2 text-white uppercase" style="touch-action:auto;user-select:text" />
+          <button id="zc-join-room" disabled class="rounded-lg bg-emerald-500 px-3 py-2 font-bold text-slate-950 disabled:opacity-40">Unirse</button>
+        </div>
+        <div id="zc-room-status" class="text-xs text-slate-300">Todavía no estás en una sala.</div>
+        <button id="zc-start-match" disabled class="w-full rounded-lg bg-rose-600 px-3 py-2 font-bold text-white disabled:opacity-40">Entrar a la partida</button>
+      </div>
+      <p class="text-[10px] leading-4 text-slate-500">Prototipo online: esta primera integración sincroniza posición y orientación. El combate, daño, bots y resultados siguen siendo locales. En el alojamiento gratuito, las cuentas SQLite pueden perderse al reiniciarse el servicio.</p>
+    </div>
+  </div>
+  <button id="zc-online-open" class="fixed bottom-4 left-4 z-[70] hidden rounded-xl border border-cyan-400/50 bg-slate-950/90 px-4 py-3 text-xs font-bold text-cyan-200 shadow-xl" style="touch-action:manipulation">🌐 ONLINE</button>
+
+  <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+  <script>
+  (() => {
+    'use strict';
+    const SERVER_URL = 'https://zona-cero-online.onrender.com';
+    const $ = id => document.getElementById(id);
+    const modal = $('zc-online-modal');
+    const status = $('zc-account-status');
+    const roomStatus = $('zc-room-status');
+    let token = null, socket = null, currentRoom = null, currentUser = null;
+    const remotePlayers = new Map();
+    const playerNames = new Map();
+    let lastSent = 0;
+
+    const say = (el, msg, bad=false) => { el.textContent = msg; el.className = bad ? 'rounded-lg bg-rose-950/70 p-2 text-xs text-rose-200' : 'rounded-lg bg-slate-950 p-2 text-xs text-emerald-200'; };
+    async function api(path, method='GET', body=null) {
+      const res = await fetch(SERVER_URL + path, { method, headers: { 'Content-Type':'application/json', ...(token ? {Authorization:'Bearer '+token} : {}) }, body: body ? JSON.stringify(body) : undefined });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `Error HTTP ${res.status}`);
+      return data;
+    }
+    function setAuthReady(user, newToken) {
+      token = newToken; currentUser = user;
+      try { localStorage.setItem('zc_online_token', token); } catch (_) {}
+      status.textContent = `Conectado como ${user.username}. Ya puedes crear o unirte a una sala.`;
+      $('zc-create-room').disabled = false; $('zc-join-room').disabled = false;
+      if (socket) socket.disconnect();
+      socket = window.io(SERVER_URL, { transports:['websocket','polling'], auth:{token} });
+      socket.on('connect', () => say(status, `Conectado al servidor como ${user.username}.`));
+      socket.on('connect_error', err => say(status, `No se pudo conectar: ${err.message}`, true));
+      socket.on('room:state', room => {
+        currentRoom = room;
+        roomStatus.textContent = `Sala ${room.code} • ${room.count}/${room.capacity} jugadores`;
+        $('zc-room-code').value = room.code;
+        $('zc-start-match').disabled = false;
+        reconcileRemotePlayers(room.players || []);
+      });
+      socket.on('player:state', state => updateRemotePlayer(state));
+      socket.on('room:player-left', info => {
+        const old = remotePlayers.get(info.socketId);
+        if (old && old.mesh && old.mesh.parent) old.mesh.parent.remove(old.mesh);
+        remotePlayers.delete(info.socketId); playerNames.delete(info.socketId);
+      });
+      socket.on('disconnect', () => { if (token) say(status, 'Conexión interrumpida. Intentando reconectar…', true); });
+    }
+    async function authenticate(which) {
+      const username = $('zc-username').value.trim();
+      const password = $('zc-password').value;
+      try {
+        say(status, which === 'register' ? 'Creando cuenta…' : 'Iniciando sesión…');
+        const data = await api('/api/' + which, 'POST', {username,password});
+        setAuthReady(data.user, data.token);
+        $('zc-password').value = '';
+      } catch (e) { say(status, e.message, true); }
+    }
+    function createAvatar() {
+      const group = new THREE.Group();
+      const body = new THREE.Mesh(new THREE.BoxGeometry(0.62, 1.05, 0.34), new THREE.MeshStandardMaterial({color:0x16b8c9, roughness:0.8}));
+      body.position.y = 0.95; body.castShadow = true; group.add(body);
+      const head = new THREE.Mesh(new THREE.SphereGeometry(0.23, 10, 8), new THREE.MeshStandardMaterial({color:0xd8b18a}));
+      head.position.y = 1.65; head.castShadow = true; group.add(head);
+      const label = document.createElement('canvas'); label.width=256; label.height=64;
+      const ctx = label.getContext('2d'); ctx.fillStyle='rgba(2,6,23,.8)'; ctx.fillRect(0,0,256,64); ctx.fillStyle='#a5f3fc'; ctx.font='bold 25px Arial'; ctx.textAlign='center'; ctx.fillText('JUGADOR',128,42);
+      const tex = new THREE.CanvasTexture(label);
+      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({map:tex, transparent:true})); sprite.scale.set(2.2,0.55,1); sprite.position.y=2.15; group.add(sprite);
+      group.userData.labelCanvas = label;
+      return group;
+    }
+    function setLabel(group, name) {
+      const sprite=group.children[2]; const canvas=group.userData.labelCanvas; const ctx=canvas.getContext('2d');
+      ctx.clearRect(0,0,canvas.width,canvas.height); ctx.fillStyle='rgba(2,6,23,.82)'; ctx.fillRect(0,0,256,64); ctx.fillStyle='#a5f3fc'; ctx.font='bold 25px Arial'; ctx.textAlign='center'; ctx.fillText(String(name||'JUGADOR').slice(0,18),128,42); sprite.material.map.needsUpdate=true;
+    }
+    function ensureRemote(id, name) {
+      let item=remotePlayers.get(id);
+      if (!item) { const mesh=createAvatar(); setLabel(mesh,name); item={mesh, target:null}; remotePlayers.set(id,item); if (scene) scene.add(mesh); }
+      else setLabel(item.mesh,name);
+      return item;
+    }
+    function updateRemotePlayer(data) {
+      if (!data || !data.socketId || !Number.isFinite(data.x) || !Number.isFinite(data.z)) return;
+      const username=data.username || playerNames.get(data.socketId) || 'JUGADOR';
+      if (data.username) playerNames.set(data.socketId, data.username);
+      const item=ensureRemote(data.socketId, username);
+      item.target={x:data.x, y:(Number.isFinite(data.y) && data.y > 0.5)?data.y-1.72:0, z:data.z, yaw:Number.isFinite(data.yaw)?data.yaw:0};
+    }
+    function reconcileRemotePlayers(players) {
+      const keep=new Set();
+      players.forEach(p=>{ playerNames.set(p.socketId, p.username || 'JUGADOR'); if (p.socketId !== (socket && socket.id)) { keep.add(p.socketId); updateRemotePlayer(p); } });
+      for (const [id,item] of remotePlayers) if (!keep.has(id)) { if(item.mesh.parent) item.mesh.parent.remove(item.mesh); remotePlayers.delete(id); playerNames.delete(id); }
+    }
+    function createRoom() {
+      if (!socket || !socket.connected) return say(roomStatus,'Espera a que conecte el servidor.',true);
+      socket.emit('room:create', {}, res => {
+        if (!res || !res.ok) return say(roomStatus,res?.error || 'No se pudo crear la sala.',true);
+        currentRoom=res.room; roomStatus.textContent=`Sala creada: ${res.room.code} • comparte este código`;
+        $('zc-room-code').value=res.room.code; $('zc-start-match').disabled=false;
+      });
+    }
+    function joinRoom() {
+      if (!socket || !socket.connected) return say(roomStatus,'Espera a que conecte el servidor.',true);
+      const code=$('zc-room-code').value.trim().toUpperCase();
+      if (!code) return say(roomStatus,'Escribe el código de sala.',true);
+      socket.emit('room:join',{code},res=>{
+        if (!res || !res.ok) return say(roomStatus,res?.error || 'No se pudo entrar.',true);
+        currentRoom=res.room; roomStatus.textContent=`Dentro de la sala ${res.room.code} • ${res.room.count}/${res.room.capacity}`;
+        $('zc-start-match').disabled=false;
+      });
+    }
+    $('zc-online-open').addEventListener('click',()=>modal.classList.remove('hidden'));
+    $('zc-online-close').addEventListener('click',()=>modal.classList.add('hidden'));
+    $('zc-register').addEventListener('click',()=>authenticate('register'));
+    $('zc-login').addEventListener('click',()=>authenticate('login'));
+    $('zc-create-room').addEventListener('click',createRoom);
+    $('zc-join-room').addEventListener('click',joinRoom);
+    $('zc-start-match').addEventListener('click',()=>{
+      if (!currentRoom) return;
+      modal.classList.add('hidden');
+      if (typeof startMatch === 'function') startMatch();
+      setTimeout(()=>{ for (const [id,item] of remotePlayers) if(scene && !item.mesh.parent) scene.add(item.mesh); }, 0);
+    });
+    const originalEnterLobby = window.enterLobby;
+    window.enterLobby = function() { if (originalEnterLobby) originalEnterLobby(); $('zc-online-open').classList.remove('hidden'); };
+    const originalStartMatch = window.startMatch;
+    window.startMatch = function() { if (originalStartMatch) originalStartMatch(); for (const [id,item] of remotePlayers) if(scene && !item.mesh.parent) scene.add(item.mesh); };
+    // Actualiza las etiquetas desde el estado de la sala inicial.
+    const oldStateHook = () => {};
+    function networkTick(now) {
+      if (socket && socket.connected && currentRoom && appState === 'playing' && now-lastSent > 80 && typeof player !== 'undefined') {
+        lastSent=now;
+        socket.volatile.emit('player:state',{x:player.pos.x,y:player.pos.y,z:player.pos.z,yaw:player.yaw,pitch:player.pitch});
+      }
+      if (typeof remotePlayers !== 'undefined' && scene) {
+        for (const item of remotePlayers.values()) if (item.target && item.mesh.parent) {
+          const t=item.target, m=item.mesh;
+          m.position.x += (t.x-m.position.x)*0.32; m.position.y += (t.y-m.position.y)*0.32; m.position.z += (t.z-m.position.z)*0.32; m.rotation.y=t.yaw;
+        }
+      }
+      requestAnimationFrame(networkTick);
+    }
+    requestAnimationFrame(networkTick);
+    // Recuperación de sesión en este navegador, sin almacenar la contraseña.
+    try {
+      const saved=localStorage.getItem('zc_online_token');
+      if (saved) {
+        token=saved;
+        api('/api/me').then(data=>setAuthReady(data.user,saved)).catch(()=>{localStorage.removeItem('zc_online_token');});
+      }
+    } catch (_) {}
+    // Comprobación de salud para detectar URL/servidor incorrectos.
+    fetch(SERVER_URL+'/health').then(r=>r.ok?r.json():Promise.reject()).then(()=>console.info('ZONA CERO online: backend disponible')).catch(()=>console.warn('ZONA CERO online: backend no disponible todavía'));
+  })();
+  </script>
+
 </body>
 </html>
